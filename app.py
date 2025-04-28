@@ -7,6 +7,7 @@ import uuid
 import json
 import threading
 import shutil # For directory cleanup
+import traceback # For detailed error logging
 
 app = Flask(__name__)
 
@@ -54,6 +55,9 @@ if len(available_devices) > 1:
     # User MUST ensure PyTorch compatibility.
     default_device = available_devices[1][0] # Usually 'cuda:0'
 
+# --- Default Language ---
+DEFAULT_LANGUAGE = 'ru' # Set default language to Russian
+
 def initialize_model(device_str):
     """Initializes and caches the Whisper model for a specific device."""
     if device_str in model_cache:
@@ -66,46 +70,34 @@ def initialize_model(device_str):
             try:
                 # Attempt to use float16 for CUDA for better performance
                 torch_dtype = torch.float16
-                # Test allocation to catch potential CUDA errors early
-                _ = torch.tensor([1.0], dtype=torch_dtype).to(device_str)
+                _ = torch.tensor([1.0], dtype=torch_dtype).to(device_str) # Test allocation
                 print(f"Using torch_dtype: {torch_dtype} on {device_str}")
             except Exception as e:
                 print(f"Warning: Could not use float16 on {device_str}, falling back to float32. Error: {e}")
                 torch_dtype = torch.float32
-                # Test float32 allocation
-                _ = torch.tensor([1.0], dtype=torch_dtype).to(device_str)
+                _ = torch.tensor([1.0], dtype=torch_dtype).to(device_str) # Test float32 allocation
             device = torch.device(device_str)
-            low_cpu_mem = True # Keep True if loading on GPU
-            # Check PyTorch compatibility warning again here if possible
-            # Note: The warning user saw happens during import/initial checks usually
+            low_cpu_mem = True
         else:
             print("Using CPU or CUDA not available/selected.")
             torch_dtype = torch.float32
-            device = torch.device('cpu') # Explicitly CPU device object
-            low_cpu_mem = False # Use more CPU RAM if needed when on CPU
-            device_str = 'cpu' # Normalize device string
+            device = torch.device('cpu')
+            low_cpu_mem = False
+            device_str = 'cpu'
             print(f"Using torch_dtype: {torch_dtype} on CPU")
 
-
-        # model_id = "openai/whisper-large-v3" # large-v3 instead of turbo? check model id
-        model_id = "distil-whisper/distil-large-v2" # Smaller, faster alternative for testing
+        # Choose your model ID
+        # model_id = "openai/whisper-large-v3"
+        model_id = "distil-whisper/distil-large-v2" # Smaller, potentially faster
 
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
             model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=low_cpu_mem, use_safetensors=True
         )
-        model.to(device) # Move model to the target device
-        # Optional: Compile model for potential speedup (requires PyTorch 2.0+)
-        # try:
-        #     model = torch.compile(model)
-        #     print("Model compiled successfully.")
-        # except Exception as e:
-        #      print(f"Model compilation failed: {e}")
+        model.to(device)
 
         processor = AutoProcessor.from_pretrained(model_id)
 
-        # Use device index for pipeline if CUDA, otherwise -1 for CPU
         pipeline_device_arg = device if 'cuda' in device_str else 'cpu'
-
 
         pipe = pipeline(
             "automatic-speech-recognition",
@@ -113,125 +105,131 @@ def initialize_model(device_str):
             tokenizer=processor.tokenizer,
             feature_extractor=processor.feature_extractor,
             torch_dtype=torch_dtype,
-            device=pipeline_device_arg, # Pass torch.device object
-            # chunk_length_s=30, # Optional: Adjust chunk length
-            # stride_length_s=5,  # Optional: Adjust stride
+            device=pipeline_device_arg,
         )
         model_cache[device_str] = pipe
         print(f"Model initialized successfully for {device_str}.")
         return pipe
     except Exception as e:
         print(f"FATAL: Failed to initialize model on device {device_str}: {e}")
-        # Remove potentially corrupted cache entry
+        traceback.print_exc()
         if device_str in model_cache:
             del model_cache[device_str]
-        # Important: Reraise the exception so the calling route knows initialization failed
         raise RuntimeError(f"Model initialization failed for {device_str}") from e
 
 
-# --- Transcription Core Logic ---
+# --- Transcription Core Logic (Corrected) ---
 def process_transcription(audio_path, device_str, language, translate, transcription_id, task_id=None, original_filename="Unknown"):
     """
     Processes a single audio file for transcription.
-    Assumes audio_path points to a valid audio file (e.g., WAV).
-    Handles model loading, transcription, saving results, and task status updates.
+    Handles model loading, transcription/translation, saving results, and task status updates.
     """
     processing_started = False
     try:
         print(f"[Task {task_id or 'Sync'}] Processing {original_filename} on {device_str}...")
 
-        # Get the model pipeline for the specified device
-        # This will initialize if not already cached
         pipe = initialize_model(device_str)
-        processing_started = True # Mark that we at least started processing
+        processing_started = True
 
         # Prepare generation arguments
         generate_kwargs = {}
+
+        # --- Language Handling ---
+        # If language is provided AND it's not 'auto', use it.
         if language and language != 'auto':
             generate_kwargs['language'] = language
-            print(f"[Task {task_id or 'Sync'}] Language set to: {language}")
+            print(f"[Task {task_id or 'Sync'}] Language explicitly set to: {language}")
+        else:
+            # If 'auto' or not provided (though routes default to 'ru'), let model detect.
+            # No 'language' key is added to generate_kwargs in this case.
+            print(f"[Task {task_id or 'Sync'}] Language set to automatic detection by the model.")
+
+        # --- Explicitly set the task (transcribe or translate) --- CORRECTED LOGIC ---
         if translate:
-            generate_kwargs['task'] = 'translate'
-            print(f"[Task {task_id or 'Sync'}] Translation to English enabled.")
+            # Check if translation is permissible (source language is not explicitly English)
+            current_transcription_language = generate_kwargs.get('language', None)
 
-        # Perform transcription
-        print(f"[Task {task_id or 'Sync'}] Starting transcription for {audio_path}...")
-        # result = pipe(audio_path, return_timestamps=True, generate_kwargs=generate_kwargs)
-        # Simpler call for potentially faster inference if timestamps aren't strictly needed now
-        result = pipe(audio_path, generate_kwargs=generate_kwargs)
+            # Allow translation attempt even if language is 'auto'.
+            # Forbid translation ONLY if language is explicitly set to 'en'.
+            if current_transcription_language != 'en':
+                generate_kwargs['task'] = 'translate'
+                print(f"[Task {task_id or 'Sync'}] Translation to English requested.")
+            else:
+                # Source is English, translation makes no sense, force transcribe
+                generate_kwargs['task'] = 'transcribe'
+                print(f"[Task {task_id or 'Sync'}] Translation skipped (source is English), task set to transcribe.")
+        else:
+            # If translation is NOT requested, ALWAYS use transcribe
+            generate_kwargs['task'] = 'transcribe'
+            print(f"[Task {task_id or 'Sync'}] Task explicitly set to transcribe.")
+        # --- End of task setting logic ---
+
+        # Perform transcription/translation
+        print(f"[Task {task_id or 'Sync'}] Starting inference for {audio_path} with kwargs: {generate_kwargs}...") # Log kwargs
+        # Use generate_kwargs argument in the pipeline call
+        result = pipe(audio_path, generate_kwargs=generate_kwargs, return_timestamps=False) # Timestamps optional
         transcription_text = result["text"]
-        print(f"[Task {task_id or 'Sync'}] Transcription completed.")
+        print(f"[Task {task_id or 'Sync'}] Inference completed.")
 
-        # Save transcription to file
+        # Save transcription/translation to file
         transcription_path = os.path.join(TRANSCRIPTION_FOLDER, f'{transcription_id}.txt')
-        os.makedirs(os.path.dirname(transcription_path), exist_ok=True) # Ensure dir exists
+        os.makedirs(os.path.dirname(transcription_path), exist_ok=True)
         with open(transcription_path, 'w', encoding='utf-8') as f:
             f.write(transcription_text)
-        print(f"[Task {task_id or 'Sync'}] Transcription saved to {transcription_path}")
+        print(f"[Task {task_id or 'Sync'}] Result saved to {transcription_path}")
 
         # Update task status if asynchronous
         if task_id:
             with tasks_lock:
-                if task_id in tasks: # Check if task still exists
+                if task_id in tasks:
                     tasks[task_id]['status'] = 'completed'
                     tasks[task_id]['transcription'] = transcription_text
                     tasks[task_id]['id'] = transcription_id
-                    # tasks[task_id]['filename'] = original_filename # Filename already set
                     print(f"[Task {task_id}] Status updated to completed.")
                 else:
                     print(f"[Task {task_id}] Warning: Task ID not found during completion update.")
 
-        return transcription_text # Return text for synchronous case
+        return transcription_text
 
     except Exception as e:
         print(f"[Task {task_id or 'Sync'}] Error during transcription processing: {e}")
-        import traceback
-        traceback.print_exc() # Print full traceback for debugging
+        traceback.print_exc()
 
         if task_id:
             with tasks_lock:
-                 if task_id in tasks: # Check if task still exists
+                 if task_id in tasks:
                     tasks[task_id]['status'] = 'error'
                     tasks[task_id]['error'] = str(e)
-                    # tasks[task_id]['filename'] = original_filename # Filename already set
                     print(f"[Task {task_id}] Status updated to error.")
                  else:
                     print(f"[Task {task_id}] Warning: Task ID not found during error update.")
         else:
-            # --- CRITICAL FIX for synchronous calls ---
-            # Re-raise the exception so the calling route knows about the failure
-            raise e
+            raise e # Re-raise for synchronous calls
 
     finally:
-        # --- Cleanup ---
-        # Delete the intermediate audio file passed to this function
-        # (Could be the original upload or the extracted WAV)
+        # Cleanup intermediate audio file
         if audio_path and os.path.exists(audio_path):
              try:
                  print(f"[Task {task_id or 'Sync'}] Cleaning up intermediate file: {audio_path}")
                  os.remove(audio_path)
              except OSError as err:
                  print(f"[Task {task_id or 'Sync'}] Warning: Could not delete intermediate file {audio_path}: {err}")
-        # Note: The original uploaded file (if different from audio_path, e.g., video)
-        # should be cleaned up by the calling function (transcribe or transcribe_finalize_helper)
 
 
 def convert_to_wav(input_path, output_path):
     """Converts an input file (audio/video) to WAV format using ffmpeg."""
     try:
         print(f"Converting {input_path} to WAV at {output_path}...")
-        # -y: Overwrite output without asking
-        # -i: Input file
-        # -acodec pcm_s16le: Standard WAV audio codec (signed 16-bit little-endian PCM)
-        # -ar 16000: Resample audio to 16kHz (required by Whisper)
-        # -ac 1: Convert to mono audio (Whisper works best with mono)
         command = [
             FFMPEG_PATH, '-y', '-i', input_path,
-            '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', # Enforce Whisper requirements
             output_path
         ]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True, encoding='utf-8')
+        # Use capture_output=True for newer Python versions, or stdout/stderr=subprocess.PIPE
+        result = subprocess.run(command, check=True, text=True, encoding='utf-8', capture_output=True)
         print("FFmpeg conversion successful.")
+        # print("FFmpeg stdout:", result.stdout) # Optional: log ffmpeg output
+        # print("FFmpeg stderr:", result.stderr)
         return True
     except FileNotFoundError:
         print(f"Error: '{FFMPEG_PATH}' command not found. Make sure ffmpeg is installed and in your PATH or FFMPEG_PATH is set correctly.")
@@ -242,15 +240,16 @@ def convert_to_wav(input_path, output_path):
         print(f"Return Code: {e.returncode}")
         print(f"Stderr: {e.stderr}")
         print(f"Stdout: {e.stdout}")
-        # Clean up potentially incomplete output file
         if os.path.exists(output_path):
-            os.remove(output_path)
-        raise Exception(f"FFmpeg conversion failed: {e.stderr[:500]}") # Include part of stderr
+            try: os.remove(output_path)
+            except OSError: pass
+        raise Exception(f"FFmpeg conversion failed: {e.stderr[:500]}")
     except Exception as e:
         print(f"An unexpected error occurred during conversion: {e}")
-         # Clean up potentially incomplete output file
+        traceback.print_exc()
         if os.path.exists(output_path):
-            os.remove(output_path)
+            try: os.remove(output_path)
+            except OSError: pass
         raise Exception(f"Audio conversion failed: {e}")
 
 
@@ -259,14 +258,13 @@ def convert_to_wav(input_path, output_path):
 @app.route('/')
 def index():
     """Serves the main HTML page."""
-    # Update available devices each time the page is loaded
     global available_devices, default_device
     available_devices = get_available_devices()
     if len(available_devices) > 1:
-        default_device = available_devices[1][0] # Default to first GPU if available
+        default_device = available_devices[1][0]
     else:
         default_device = 'cpu'
-    return render_template_string(HTML, available_devices=available_devices, default_device=default_device)
+    return render_template_string(HTML, available_devices=available_devices, default_device=default_device, default_language=DEFAULT_LANGUAGE)
 
 # --- Non-Chunked Transcription ---
 
@@ -279,113 +277,95 @@ def transcribe():
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
 
-    # Use form data for parameters in non-chunked uploads
+    # Get parameters, default language to Russian ('ru')
     device_str = request.form.get('device', default_device)
-    language = request.form.get('language', 'auto')
+    language = request.form.get('language', DEFAULT_LANGUAGE)
     translate = request.form.get('translate', 'false').lower() == 'true'
     polling = request.form.get('polling', 'false').lower() == 'true'
     original_filename = file.filename
+    print(f"Received request for {original_filename}: lang={language}, translate={translate}, polling={polling}, device={device_str}")
 
-    # Save the uploaded file securely
     upload_id = str(uuid.uuid4())
     _, file_extension = os.path.splitext(original_filename)
-    # Include original filename (sanitized) for easier identification? Maybe just use UUID.
+    # Sanitize filename? For now, just use UUID + extension
     saved_filename = f"{upload_id}{file_extension}"
     raw_upload_path = os.path.join(UPLOAD_FOLDER, saved_filename)
+    audio_to_process = None # Path to the final WAV file
 
-    audio_to_process = None # Path to the final audio file (WAV) for transcription
     try:
         file.save(raw_upload_path)
         print(f"File saved to {raw_upload_path}")
 
-        # Check if conversion is needed (video or non-wav audio)
+        # Check if conversion is needed
         is_video = file_extension.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv']
-        is_common_audio = file_extension.lower() in ['.mp3', '.m4a', '.ogg', '.flac'] # Add other audio types if needed
+        is_common_audio = file_extension.lower() in ['.mp3', '.m4a', '.ogg', '.flac', '.aac', '.opus'] # Added more types
         is_wav = file_extension.lower() == '.wav'
 
+        # Convert if not WAV or if it's video/common audio that might need resampling
         if is_video or is_common_audio or not is_wav:
             wav_filename = f"{upload_id}.wav"
             audio_to_process = os.path.join(UPLOAD_FOLDER, wav_filename)
             if not convert_to_wav(raw_upload_path, audio_to_process):
-                 # convert_to_wav now raises exceptions on failure
-                 raise Exception("Audio conversion failed.") # Should be caught below
+                 raise Exception("Audio conversion failed.") # convert_to_wav raises on error
             print(f"File converted to WAV: {audio_to_process}")
         else:
-            # It's already a WAV file (or assumed to be processable)
+            # It's already a WAV, assume it's compatible (16kHz, mono) for now
+            # TODO: Could add an ffmpeg check here too to verify WAV properties
             audio_to_process = raw_upload_path
-            print(f"File is WAV or assumed processable: {audio_to_process}")
+            print(f"File is WAV, using directly: {audio_to_process}")
 
-
-        transcription_id = str(uuid.uuid4()) # Unique ID for the transcription result
+        transcription_id = str(uuid.uuid4()) # Unique ID for the result file
 
         if polling:
-            # --- Asynchronous Processing ---
+            # --- Asynchronous ---
             task_id = str(uuid.uuid4())
             with tasks_lock:
                 tasks[task_id] = {
                     'status': 'processing',
-                    'transcription': None,
-                    'id': None, # Will be set on completion
-                    'error': None,
-                    'filename': original_filename, # Store original filename for status updates
-                    'start_time': threading.Timer(0, lambda: None) # Placeholder for potential timing
+                    'transcription': None, 'id': None, 'error': None,
+                    'filename': original_filename,
+                    'start_time': threading.Timer(0, lambda: None) # Placeholder
                 }
             print(f"[Task {task_id}] Created for async processing of {original_filename}")
 
             # Start background thread
-            # Pass audio_to_process, transcription_id, task_id, original_filename
             thread = threading.Thread(target=process_transcription,
                                       args=(audio_to_process, device_str, language, translate,
                                             transcription_id, task_id, original_filename))
-            thread.daemon = True # Allow app to exit even if threads are running
+            thread.daemon = True
             thread.start()
 
-            # Important: Don't delete raw_upload_path yet if it's different from audio_to_process
-            # process_transcription will delete audio_to_process. We need to delete raw_upload_path eventually.
-            # Let's handle raw_upload_path cleanup after the thread is *known* to have started
-            # or potentially add it to the task dict for later cleanup?
-            # For now, let's assume process_transcription handles the file it receives.
-            # If conversion happened, raw_upload_path (video/other audio) still needs cleanup.
+            # Cleanup original upload if conversion happened
             if raw_upload_path != audio_to_process and os.path.exists(raw_upload_path):
                  print(f"[Task {task_id}] Scheduling cleanup for original upload: {raw_upload_path}")
-                 # Maybe use a timer or a separate cleanup mechanism? For simplicity now:
-                 try:
-                    os.remove(raw_upload_path)
-                 except OSError as e:
-                    print(f"Warning: Failed to clean up raw upload {raw_upload_path}: {e}")
-
+                 # A more robust cleanup might use a queue or finally block in the thread
+                 try: os.remove(raw_upload_path)
+                 except OSError as e: print(f"Warning: Failed to clean up raw upload {raw_upload_path}: {e}")
 
             return jsonify({"task_id": task_id}), 202 # Accepted
 
         else:
-            # --- Synchronous Processing ---
+            # --- Synchronous ---
             print(f"Starting synchronous processing for {original_filename}...")
             transcription_text = process_transcription(
-                audio_path=audio_to_process, # Pass the path to the WAV/processable audio
-                device_str=device_str,
-                language=language,
-                translate=translate,
-                transcription_id=transcription_id,
-                task_id=None, # Indicate synchronous call
+                audio_path=audio_to_process, # Pass the path to the WAV
+                device_str=device_str, language=language, translate=translate,
+                transcription_id=transcription_id, task_id=None,
                 original_filename=original_filename
             )
-            # Cleanup the original raw upload if conversion happened
+            # Cleanup original upload if conversion happened
             if raw_upload_path != audio_to_process and os.path.exists(raw_upload_path):
-                try:
-                    os.remove(raw_upload_path)
-                except OSError as e:
-                    print(f"Warning: Failed to clean up raw upload {raw_upload_path}: {e}")
+                try: os.remove(raw_upload_path)
+                except OSError as e: print(f"Warning: Failed to clean up raw upload {raw_upload_path}: {e}")
 
             print(f"Synchronous processing complete for {original_filename}")
             # process_transcription already saved the file.
-            # Return the transcription text and ID.
             return jsonify({"transcription": transcription_text, "id": transcription_id})
 
     except Exception as e:
         print(f"Error in /transcribe route for {original_filename}: {e}")
-        import traceback
         traceback.print_exc()
-         # Cleanup any created files if an error occurred before processing started
+         # Cleanup any created files on error
         if audio_to_process and os.path.exists(audio_to_process):
             try: os.remove(audio_to_process)
             except OSError: pass
@@ -393,26 +373,6 @@ def transcribe():
             try: os.remove(raw_upload_path)
             except OSError: pass
         return jsonify({"error": f"Processing failed: {str(e)}"}), 500
-
-
-# This route is redundant if /transcribe handles the 'polling' parameter
-# @app.route('/transcribe_async', methods=['POST'])
-# def transcribe_async():
-#     # Kept for potential API compatibility, but logic is in /transcribe
-#     # Ensure 'polling=true' is implicitly set or handled
-#     # For simplicity, let's just forward or duplicate logic if needed.
-#     # Or better: have the JS always call /transcribe and set the polling form data.
-#     # The current JS seems to call /transcribe_async? Let's adjust JS instead.
-#     # return transcribe() # This would re-read form data etc.
-#     # Let's remove this route and have JS call /transcribe?
-#     # Okay, keeping it for now as JS calls it, but it just forwards.
-#     # This requires the form data to be sent correctly by JS.
-#     # We need to ensure JS sends all params to /transcribe_async as well.
-#     # It seems the JS *does* send the parameters.
-#     # Let's explicitly set polling=True here.
-#     request.form = request.form.copy() # Make form mutable if needed
-#     request.form['polling'] = 'true' # Force polling=true for this route
-#     return transcribe()
 
 
 # --- Chunked Transcription ---
@@ -439,53 +399,47 @@ def transcribe_chunk():
     # Save chunk
     temp_dir = os.path.join(TEMP_CHUNK_FOLDER, file_id)
     os.makedirs(temp_dir, exist_ok=True)
-    # Use zero-padded index for correct sorting later
-    chunk_filename = os.path.join(temp_dir, f'chunk_{chunk_index:06d}')
+    chunk_filename = os.path.join(temp_dir, f'chunk_{chunk_index:06d}') # Zero-padded for sorting
     try:
         chunk.save(chunk_filename)
-        print(f"Received chunk {chunk_index + 1}/{total_chunks} for fileId {file_id}")
+        # print(f"Received chunk {chunk_index + 1}/{total_chunks} for fileId {file_id}") # Less verbose logging
 
         # --- Store parameters with the last chunk ---
-        # We need device, language, translate for the finalization step.
-        # Let's store them in a JSON file within the temp chunk directory
-        # when the last chunk arrives.
         if chunk_index == total_chunks - 1:
+            # Default language to Russian ('ru')
             params = {
                 'device': request.form.get('device', default_device),
-                'language': request.form.get('language', 'auto'),
+                'language': request.form.get('language', DEFAULT_LANGUAGE),
                 'translate': request.form.get('translate', 'false').lower() == 'true',
                 'polling': request.form.get('polling', 'false').lower() == 'true',
-                'original_filename': request.form.get('originalFilename', f"{file_id}_chunked_file") # Get filename from JS
+                'original_filename': request.form.get('originalFilename', f"{file_id}_chunked_file")
             }
             params_path = os.path.join(temp_dir, 'params.json')
             with open(params_path, 'w') as f:
                 json.dump(params, f)
-            print(f"Parameters saved for fileId {file_id}")
+            print(f"Parameters saved for fileId {file_id}: {params}")
+
+        # Return minimal success message to reduce log spam
+        if (chunk_index + 1) % 10 == 0 or chunk_index == total_chunks - 1: # Log every 10 chunks and the last one
+             print(f"Received chunk {chunk_index + 1}/{total_chunks} for fileId {file_id}")
 
         return jsonify({"message": f"Chunk {chunk_index + 1}/{total_chunks} received"}), 200
     except Exception as e:
         print(f"Error saving chunk {chunk_index} for fileId {file_id}: {e}")
+        traceback.print_exc()
         return jsonify({"error": "Failed to save chunk"}), 500
-
-# This route might be redundant now if transcribe_chunk handles param saving
-# @app.route('/transcribe_chunk_async', methods=['POST'])
-# def transcribe_chunk_async():
-#     # Kept for potential compatibility, assumes JS calls this for async chunks
-#     # The logic is the same as transcribe_chunk, including saving params on last chunk
-#     return transcribe_chunk()
 
 
 def reconstruct_file_from_chunks(file_id, temp_dir):
     """Reconstructs the original file from saved chunks."""
-    reconstructed_path = None # Initialize path
+    reconstructed_path = None
     try:
         chunk_files = sorted([f for f in os.listdir(temp_dir) if f.startswith('chunk_')])
         if not chunk_files:
-            raise ValueError("No chunk files found.")
+            raise ValueError(f"No chunk files found in {temp_dir}.")
 
-        # Determine the original filename/extension if possible from params
         params_path = os.path.join(temp_dir, 'params.json')
-        original_filename = f"{file_id}_reconstructed" # Default
+        original_filename = f"{file_id}_reconstructed"
         if os.path.exists(params_path):
              with open(params_path, 'r') as f:
                 params = json.load(f)
@@ -494,29 +448,31 @@ def reconstruct_file_from_chunks(file_id, temp_dir):
         _, file_extension = os.path.splitext(original_filename)
         if not file_extension: file_extension = ".bin" # Default extension if unknown
 
-        # Use a unique name for the reconstructed file in the uploads folder
         reconstructed_filename = f"{file_id}_reconstructed{file_extension}"
         reconstructed_path = os.path.join(UPLOAD_FOLDER, reconstructed_filename)
 
-        print(f"Reconstructing file {file_id} to {reconstructed_path}...")
+        print(f"Reconstructing file {file_id} from {len(chunk_files)} chunks to {reconstructed_path}...")
         with open(reconstructed_path, 'wb') as outfile:
             for chunk_file in chunk_files:
                 chunk_path = os.path.join(temp_dir, chunk_file)
-                with open(chunk_path, 'rb') as infile:
-                    outfile.write(infile.read())
+                try:
+                    with open(chunk_path, 'rb') as infile:
+                        outfile.write(infile.read())
+                except Exception as read_err:
+                    print(f"Error reading chunk file {chunk_path}: {read_err}")
+                    raise # Re-raise to stop reconstruction
         print(f"File reconstruction complete: {reconstructed_path}")
         return reconstructed_path, original_filename
 
     except Exception as e:
         print(f"Error reconstructing file {file_id}: {e}")
-        # Clean up partially reconstructed file if it exists
+        traceback.print_exc()
         if reconstructed_path and os.path.exists(reconstructed_path):
             try: os.remove(reconstructed_path)
             except OSError: pass
-        raise # Re-raise the exception
+        raise
 
 
-# Consolidate finalize logic
 def transcribe_finalize_logic(file_id):
     """Handles reconstruction and transcription initiation for chunked uploads."""
     temp_dir = os.path.join(TEMP_CHUNK_FOLDER, file_id)
@@ -525,44 +481,44 @@ def transcribe_finalize_logic(file_id):
     original_filename = f"{file_id}_chunked_file" # Default
 
     if not os.path.isdir(temp_dir):
-        print(f"Error: Chunk directory not found for fileId {file_id}")
+        print(f"Error: Chunk directory not found for fileId {file_id} at {temp_dir}")
         raise FileNotFoundError("Chunks not found. Upload may be incomplete or expired.")
 
     try:
         # Load parameters saved with the last chunk
         params_path = os.path.join(temp_dir, 'params.json')
         if not os.path.exists(params_path):
-             raise FileNotFoundError("Parameters file (params.json) not found in chunk directory.")
+             raise FileNotFoundError(f"Parameters file (params.json) not found in chunk directory {temp_dir}.")
         with open(params_path, 'r') as f:
             params = json.load(f)
 
+        # Use default 'ru' if language missing in params.json for some reason
         device_str = params.get('device', default_device)
-        language = params.get('language', 'auto')
+        language = params.get('language', DEFAULT_LANGUAGE)
         translate = params.get('translate', False)
         polling = params.get('polling', False)
         original_filename = params.get('original_filename', original_filename)
+        print(f"Finalizing {original_filename} (ID: {file_id}): lang={language}, translate={translate}, polling={polling}, device={device_str}")
 
         # Reconstruct the file
         reconstructed_file_path, _ = reconstruct_file_from_chunks(file_id, temp_dir)
-        # _, original_filename was also returned, but we already got it from params
 
-        # --- Conversion Logic (similar to non-chunked) ---
+        # --- Conversion Logic (same as non-chunked) ---
         _, file_extension = os.path.splitext(reconstructed_file_path)
         is_video = file_extension.lower() in ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv']
-        is_common_audio = file_extension.lower() in ['.mp3', '.m4a', '.ogg', '.flac']
+        is_common_audio = file_extension.lower() in ['.mp3', '.m4a', '.ogg', '.flac', '.aac', '.opus']
         is_wav = file_extension.lower() == '.wav'
 
         if is_video or is_common_audio or not is_wav:
-            wav_filename = f"{file_id}_reconstructed.wav"
+            wav_filename = f"{file_id}_reconstructed.wav" # Use unique name
             audio_to_process = os.path.join(UPLOAD_FOLDER, wav_filename)
             if not convert_to_wav(reconstructed_file_path, audio_to_process):
                  raise Exception("Audio conversion failed during finalization.")
             print(f"Reconstructed file converted to WAV: {audio_to_process}")
         else:
             audio_to_process = reconstructed_file_path
-            print(f"Reconstructed file is WAV or assumed processable: {audio_to_process}")
+            print(f"Reconstructed file is WAV, using directly: {audio_to_process}")
         # --- End Conversion Logic ---
-
 
         transcription_id = str(uuid.uuid4())
 
@@ -572,53 +528,49 @@ def transcribe_finalize_logic(file_id):
             with tasks_lock:
                 tasks[task_id] = {
                     'status': 'processing',
-                    'transcription': None,
-                    'id': None,
-                    'error': None,
+                    'transcription': None, 'id': None, 'error': None,
                     'filename': original_filename,
-                    'start_time': threading.Timer(0, lambda: None) # Placeholder
+                    'start_time': threading.Timer(0, lambda: None)
                 }
             print(f"[Task {task_id}] Created for async finalization of chunked file {original_filename} (ID: {file_id})")
 
+            # Pass audio_to_process (the WAV file) to the transcription thread
             thread = threading.Thread(target=process_transcription,
                                       args=(audio_to_process, device_str, language, translate,
                                             transcription_id, task_id, original_filename))
             thread.daemon = True
             thread.start()
 
-             # Cleanup reconstructed file if conversion happened
+            # Cleanup reconstructed (original format) file if conversion happened
             if reconstructed_file_path != audio_to_process and os.path.exists(reconstructed_file_path):
                 print(f"[Task {task_id}] Scheduling cleanup for reconstructed file: {reconstructed_file_path}")
                 try: os.remove(reconstructed_file_path)
-                except OSError as e: print(f"Warning: Failed to clean up {reconstructed_file_path}: {e}")
+                except OSError as e: print(f"Warning: Failed to clean up reconstructed file {reconstructed_file_path}: {e}")
 
-            # Cleanup temp chunk dir after thread starts
+            # Cleanup temp chunk dir after starting thread
             try:
                 shutil.rmtree(temp_dir)
                 print(f"Cleaned up chunk directory: {temp_dir}")
             except OSError as e:
                 print(f"Warning: Failed to clean up chunk directory {temp_dir}: {e}")
 
-
             return {"task_id": task_id}, 202 # Accepted
 
         else:
             # --- Synchronous Finalization ---
             print(f"Starting synchronous finalization for chunked file {original_filename} (ID: {file_id})...")
+            # Pass audio_to_process (the WAV file) to the transcription function
             transcription_text = process_transcription(
                 audio_path=audio_to_process,
-                device_str=device_str,
-                language=language,
-                translate=translate,
-                transcription_id=transcription_id,
-                task_id=None,
+                device_str=device_str, language=language, translate=translate,
+                transcription_id=transcription_id, task_id=None,
                 original_filename=original_filename
             )
 
-            # Cleanup reconstructed file if conversion happened
+            # Cleanup reconstructed (original format) file if conversion happened
             if reconstructed_file_path != audio_to_process and os.path.exists(reconstructed_file_path):
                 try: os.remove(reconstructed_file_path)
-                except OSError as e: print(f"Warning: Failed to clean up {reconstructed_file_path}: {e}")
+                except OSError as e: print(f"Warning: Failed to clean up reconstructed file {reconstructed_file_path}: {e}")
 
             # Cleanup temp chunk dir
             try:
@@ -627,13 +579,11 @@ def transcribe_finalize_logic(file_id):
             except OSError as e:
                 print(f"Warning: Failed to clean up chunk directory {temp_dir}: {e}")
 
-
             print(f"Synchronous finalization complete for {original_filename}")
             return {"transcription": transcription_text, "id": transcription_id}, 200 # OK
 
     except Exception as e:
         print(f"Error during finalize logic for fileId {file_id}: {e}")
-        import traceback
         traceback.print_exc()
          # Attempt broader cleanup on error
         if audio_to_process and os.path.exists(audio_to_process):
@@ -662,7 +612,10 @@ def transcribe_finalize():
     except FileNotFoundError as e:
          return jsonify({"error": str(e)}), 404 # Chunks or params not found
     except Exception as e:
-        return jsonify({"error": f"Finalization failed: {str(e)}"}), 500
+        # Log the error details server-side
+        print(f"Error in /transcribe_finalize for fileId {file_id}: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Finalization failed: An internal error occurred."}), 500 # Avoid sending detailed errors
 
 @app.route('/transcribe_finalize_async', methods=['POST'])
 def transcribe_finalize_async():
@@ -672,18 +625,19 @@ def transcribe_finalize_async():
         return jsonify({"error": "fileId missing in request body"}), 400
     file_id = data['fileId']
     try:
-        # Force polling=True if called via this route? The logic relies on params.json now.
-        # The JS should ensure polling=true is set correctly when sending chunks if this route is used.
+        # The polling decision is read from params.json inside transcribe_finalize_logic
         result, status_code = transcribe_finalize_logic(file_id)
         # Ensure the result is a task_id if successful async
         if status_code == 202 and 'task_id' not in result:
-             print("Error: Async finalize logic didn't return task_id correctly.")
+             print(f"Error: Async finalize logic for {file_id} didn't return task_id correctly.")
              return jsonify({"error": "Internal server error: async task creation failed"}), 500
         return jsonify(result), status_code
     except FileNotFoundError as e:
          return jsonify({"error": str(e)}), 404 # Chunks or params not found
     except Exception as e:
-        return jsonify({"error": f"Async finalization failed: {str(e)}"}), 500
+        print(f"Error in /transcribe_finalize_async for fileId {file_id}: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Async finalization failed: An internal error occurred."}), 500
 
 
 # --- Status and Download ---
@@ -691,12 +645,21 @@ def transcribe_finalize_async():
 @app.route('/status/<task_id>')
 def status(task_id):
     """Checks the status of an asynchronous task."""
+    # Basic validation of task_id format might be good here (e.g., is it a UUID?)
+    try:
+        uuid.UUID(task_id)
+    except ValueError:
+        print(f"Invalid task_id format received: {task_id}")
+        return jsonify({"status": "not_found", "error": "Invalid task ID format."}), 400
+
     with tasks_lock:
         task = tasks.get(task_id)
         if not task:
+            # Could optionally check if a result file exists for this ID (if tasks get cleaned up)
+            print(f"Task ID not found in active tasks: {task_id}")
             return jsonify({"status": "not_found", "error": "Task ID not found or expired."}), 404
 
-        # Return a copy to avoid modifying the original dict outside the lock
+        # Return a copy to avoid race conditions when accessing outside the lock
         task_snapshot = task.copy()
 
     # Process the snapshot outside the lock
@@ -704,10 +667,12 @@ def status(task_id):
     if task_snapshot['status'] == 'completed':
         response["transcription"] = task_snapshot['transcription']
         response["id"] = task_snapshot['id']
-        # Optionally remove completed task after a delay?
+        # Optionally remove completed task from `tasks` dict after some time?
     elif task_snapshot['status'] == 'error':
-        response["error"] = task_snapshot['error']
-        # Optionally remove failed task after a delay?
+        # Avoid sending detailed internal errors to the client
+        response["error"] = "An error occurred during processing." # Generic error message
+        print(f"Task {task_id} failed with error: {task_snapshot.get('error', 'Unknown error')}") # Log detailed error server-side
+        # Optionally remove failed task?
 
     return jsonify(response)
 
@@ -715,136 +680,154 @@ def status(task_id):
 @app.route('/download/<transcription_id>')
 def download(transcription_id):
     """Downloads the transcription text file."""
-    # Basic security check: ensure transcription_id looks like a UUID and filename is simple
+    # Validate transcription_id format and prevent path traversal
     try:
         uuid.UUID(transcription_id) # Validate UUID format
         filename = f"{transcription_id}.txt"
-        if ".." in filename or "/" in filename or "\\" in filename: # Prevent directory traversal
-             raise ValueError("Invalid transcription ID format.")
-    except ValueError:
+        # Basic path traversal check
+        if not filename.isalnum() and '_' not in filename and '.' not in filename:
+             # Allow only alphanumeric, underscore, dot - adjust if needed, but be strict
+             raise ValueError("Invalid characters in transcription ID.")
+        # Securely join path
+        transcription_path = os.path.join(TRANSCRIPTION_FOLDER, filename)
+        # Check if the resolved path is still within the intended folder
+        if not os.path.abspath(transcription_path).startswith(os.path.abspath(TRANSCRIPTION_FOLDER)):
+            raise ValueError("Invalid path.")
+    except ValueError as e:
+        print(f"Invalid download request: {e} (ID: {transcription_id})")
         return jsonify({"error": "Invalid request"}), 400
 
-    transcription_path = os.path.join(TRANSCRIPTION_FOLDER, filename)
-
-    if not os.path.exists(transcription_path):
+    if not os.path.exists(transcription_path) or not os.path.isfile(transcription_path):
+        print(f"Download request failed: File not found at {transcription_path}")
         return jsonify({"error": "Transcription file not found."}), 404
 
     try:
         return send_file(transcription_path, as_attachment=True, download_name=f"{transcription_id}_transcription.txt")
     except Exception as e:
         print(f"Error sending file {transcription_path}: {e}")
+        traceback.print_exc()
         return jsonify({"error": "Could not send file."}), 500
 
 
-# --- HTML Template (Minor Adjustments Needed in JS) ---
-# The HTML itself looks mostly fine, but the JavaScript needs updates
-# to handle the parameter passing for chunked uploads correctly.
-
+# --- HTML Template ---
+# Includes Russian ('ru') as default, bilingual UI text where possible.
 HTML = '''
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="ru"> <!-- Primary language set to Russian -->
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Whisper Turbo 文字起こし</title>
+    <title>Whisper Распознавание речи</title>
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <style>
-        /* Add spinner styles */
         .spinner {
             border: 4px solid rgba(0, 0, 0, 0.1);
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            border-left-color: #09f;
-            animation: spin 1s ease infinite;
-            display: inline-block; /* Make it inline */
-            margin-right: 8px; /* Add some space */
-            vertical-align: middle; /* Align with text */
+            width: 24px; height: 24px; border-radius: 50%;
+            border-left-color: #09f; animation: spin 1s ease infinite;
+            display: inline-block; margin-right: 8px; vertical-align: middle;
         }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        /* Style for disabled button */
-        #submitButton:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        #submitButton:disabled { opacity: 0.5; cursor: not-allowed; }
+        .result-text { max-height: 300px; overflow-y: auto; background-color: #f9fafb; border: 1px solid #e5e7eb; padding: 8px; border-radius: 4px;} /* Style for text output */
     </style>
 </head>
 <body class="bg-gray-100 p-8">
     <div class="max-w-4xl mx-auto bg-white p-8 rounded-lg shadow-md">
-        <h1 class="text-3xl font-bold mb-6">Whisper 文字起こし</h1>
+        <h1 class="text-3xl font-bold mb-6 text-center">Whisper Распознавание речи</h1>
         <form id="uploadForm" class="mb-8">
             <!-- Device Selection -->
             <div class="mb-4">
-                <label for="deviceSelect" class="block text-sm font-medium text-gray-700 mb-2">デバイスを選択</label>
+                <label for="deviceSelect" class="block text-sm font-medium text-gray-700 mb-2">Устройство</label>
                 <select id="deviceSelect" name="device" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
                     {% for device_id, device_name in available_devices %}
                     <option value="{{ device_id }}" {% if device_id == default_device %}selected{% endif %}>{{ device_name }}</option>
                     {% endfor %}
                 </select>
             </div>
-            <!-- Polling Option -->
+             <!-- File Input -->
             <div class="mb-4">
-                <label class="inline-flex items-center">
-                    <input type="checkbox" id="pollingCheck" name="polling" value="true" class="form-checkbox h-5 w-5 text-indigo-600">
-                    <span class="ml-2 text-gray-700">非同期モード (ポーリング)</span>
-                </label>
-            </div>
-            <!-- File Input -->
-            <div class="mb-4">
-                <label for="fileInput" class="block text-sm font-medium text-gray-700 mb-2">音声/動画ファイルを選択 (複数可)</label>
+                <label for="fileInput" class="block text-sm font-medium text-gray-700 mb-2">Выберите аудио/видео файл(ы)</label>
                 <input type="file" id="fileInput" name="file" accept="audio/*,video/*" multiple required class="block w-full text-sm text-gray-500
-                    file:mr-4 file:py-2 file:px-4
-                    file:rounded-full file:border-0
-                    file:text-sm file:font-semibold
-                    file:bg-indigo-50 file:text-indigo-700
-                    hover:file:bg-indigo-100
-                ">
+                    file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0
+                    file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700
+                    hover:file:bg-indigo-100 cursor-pointer">
             </div>
-            <!-- Language Selection -->
-            <div class="mb-4">
-                <label for="languageSelect" class="block text-sm font-medium text-gray-700 mb-2">言語を選択 (任意)</label>
-                <select id="languageSelect" name="language" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
-                    <option value="auto">自動検出</option>
-                    <option value="ja">日本語</option>
-                    <option value="en">英語</option>
-                    <option value="zh">中国語</option>
-                    <option value="ko">韓国語</option>
-                    <option value="fr">フランス語</option>
-                    <option value="de">ドイツ語</option>
-                    <option value="es">スペイン語</option>
-                    <!-- Add more languages as needed -->
-                </select>
-            </div>
-            <!-- Translate Option -->
-            <div class="mb-4">
-                <label class="inline-flex items-center">
-                    <input type="checkbox" id="translateCheck" name="translate" value="true" class="form-checkbox h-5 w-5 text-indigo-600">
-                    <span class="ml-2 text-gray-700">英語に翻訳 (言語が英語以外の場合)</span>
-                </label>
-            </div>
-            <!-- Chunk Upload Settings -->
-            <div class="mb-4">
-                <label class="inline-flex items-center">
-                    <input type="checkbox" id="chunkUploadCheck" class="form-checkbox h-5 w-5 text-indigo-600" checked>
-                    <span class="ml-2 text-gray-700">チャンクアップロードを有効にする (大きなファイル向け)</span>
-                </label>
-            </div>
-            <div class="mb-4" id="chunkSizeContainer">
-                <label for="chunkSizeInput" class="block text-sm font-medium text-gray-700 mb-2">チャンクサイズ (MB)</label>
-                <input type="number" id="chunkSizeInput" min="1" max="100" value="50" class="mt-1 block w-full pl-3 pr-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
-                <p class="mt-1 text-xs text-gray-500">サーバーのメモリに応じて調整してください (推奨: 10-100MB)。</p>
-            </div>
+             <!-- Language Selection -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                    <label for="languageSelect" class="block text-sm font-medium text-gray-700 mb-2">Язык аудио</label>
+                    <select id="languageSelect" name="language" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md">
+                        <option value="ru" {% if default_language == 'ru' %}selected{% endif %}>Русский</option>
+                        <option value="auto" {% if default_language == 'auto' %}selected{% endif %}>Автоопределение</option>
+                        <option value="en" {% if default_language == 'en' %}selected{% endif %}>English</option>
+                        <option value="ja" {% if default_language == 'ja' %}selected{% endif %}>日本語</option>
+                        <option value="zh" {% if default_language == 'zh' %}selected{% endif %}>中文</option>
+                        <option value="ko" {% if default_language == 'ko' %}selected{% endif %}>한국어</option>
+                        <option value="fr" {% if default_language == 'fr' %}selected{% endif %}>Français</option>
+                        <option value="de" {% if default_language == 'de' %}selected{% endif %}>Deutsch</option>
+                        <option value="es" {% if default_language == 'es' %}selected{% endif %}>Español</option>
+                        <!-- Add more common languages -->
+                    </select>
+                     <p class="mt-1 text-xs text-gray-500">По умолчанию: Русский. "Авто" - модель попытается определить язык.</p>
+                </div>
+                <!-- Translate Option -->
+                 <div>
+                    <label for="translateCheck" class="block text-sm font-medium text-gray-700 mb-2">Действие</label>
+                    <div class="mt-1 flex items-center h-10"> <!-- Adjust height to match select -->
+                        <label class="inline-flex items-center">
+                            <input type="checkbox" id="translateCheck" name="translate" value="true" class="form-checkbox h-5 w-5 text-indigo-600 rounded">
+                            <span class="ml-2 text-gray-700">Перевести на английский</span>
+                        </label>
+                    </div>
+                     <p class="mt-1 text-xs text-gray-500">Если отмечено, результат будет на английском (если исходный не английский).</p>
+                 </div>
+             </div>
+
+            <!-- Advanced Options Toggle -->
+             <div class="mb-2">
+                <button type="button" id="toggleAdvanced" class="text-sm text-indigo-600 hover:text-indigo-800">Расширенные настройки ▼</button>
+             </div>
+
+             <!-- Advanced Options Container (Initially Hidden) -->
+            <div id="advancedOptions" class="mb-4 border border-gray-200 p-4 rounded-md" style="display: none;">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                     <!-- Chunk Upload -->
+                    <div>
+                        <label class="inline-flex items-center">
+                            <input type="checkbox" id="chunkUploadCheck" class="form-checkbox h-5 w-5 text-indigo-600 rounded" checked>
+                            <span class="ml-2 text-gray-700">Загрузка по частям</span>
+                        </label>
+                         <p class="mt-1 text-xs text-gray-500">Рекомендуется для файлов > 100MB.</p>
+                    </div>
+                     <!-- Chunk Size -->
+                    <div id="chunkSizeContainer">
+                        <label for="chunkSizeInput" class="block text-sm font-medium text-gray-700">Размер части (MB)</label>
+                        <input type="number" id="chunkSizeInput" min="5" max="100" value="50" class="mt-1 block w-full pl-3 pr-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                         <p class="mt-1 text-xs text-gray-500">5-100MB. Зависит от памяти сервера.</p>
+                    </div>
+                 </div>
+                  <!-- Polling Option -->
+                <div class="mt-4">
+                    <label class="inline-flex items-center">
+                        <input type="checkbox" id="pollingCheck" name="polling" value="true" class="form-checkbox h-5 w-5 text-indigo-600 rounded">
+                        <span class="ml-2 text-gray-700">Асинхронный режим (опрос статуса)</span>
+                    </label>
+                     <p class="mt-1 text-xs text-gray-500">Для очень долгих задач. Результат появится после завершения.</p>
+                </div>
+             </div>
+
+
             <!-- Submit Button -->
-            <button type="submit" id="submitButton" class="w-full flex justify-center items-center bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline">
-                <span id="submitButtonText">文字起こし開始</span>
+            <button type="submit" id="submitButton" class="w-full flex justify-center items-center bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline transition duration-150 ease-in-out">
+                <span id="submitButtonText">Начать распознавание</span>
                 <div id="submitSpinner" class="spinner" style="display: none;"></div>
             </button>
         </form>
         <!-- Results Area -->
-        <div id="results" class="space-y-4"></div>
+        <h2 class="text-xl font-semibold mb-4 text-center">Результаты</h2>
+        <div id="results" class="space-y-4">
+             <!-- Result containers will be added here -->
+        </div>
     </div>
 
     <script>
@@ -861,122 +844,137 @@ HTML = '''
         const submitButtonText = document.getElementById('submitButtonText');
         const submitSpinner = document.getElementById('submitSpinner');
         const chunkSizeContainer = document.getElementById('chunkSizeContainer');
-        const formElements = uploadForm.elements; // Get all form elements
+        const toggleAdvanced = document.getElementById('toggleAdvanced');
+        const advancedOptions = document.getElementById('advancedOptions');
+        const formElements = uploadForm.elements; // Get all form elements once
 
+        // --- Event Listeners ---
         chunkUploadCheck.addEventListener('change', (e) => {
             chunkSizeContainer.style.display = e.target.checked ? 'block' : 'none';
         });
+
+        toggleAdvanced.addEventListener('click', () => {
+             const isHidden = advancedOptions.style.display === 'none';
+             advancedOptions.style.display = isHidden ? 'block' : 'none';
+             toggleAdvanced.textContent = isHidden ? 'Свернуть настройки ▲' : 'Расширенные настройки ▼';
+        });
+
 
         uploadForm.addEventListener('submit', async (e) => {
             e.preventDefault();
 
             if (fileInput.files.length === 0) {
-                alert('ファイルを選択してください');
+                alert('Пожалуйста, выберите файл(ы) для загрузки.');
                 return;
             }
 
             setFormDisabled(true);
-            resultsDiv.innerHTML = ''; // Clear previous results
+            resultsDiv.innerHTML = ''; // Clear previous results on new submission
 
             const useChunkUpload = chunkUploadCheck.checked;
             const chunkSizeMB = parseInt(chunkSizeInput.value, 10) || 50;
-            const chunkSize = chunkSizeMB * 1024 * 1024; // Bytes
+            const chunkSize = chunkSizeMB * 1024 * 1024; // Size in Bytes
 
             const usePolling = pollingCheck.checked;
             const device = deviceSelect.value;
-            const language = languageSelect.value;
-            const translate = translateCheck.checked;
+            const language = languageSelect.value; // Read selected language
+            const translate = translateCheck.checked; // Read translate checkbox
 
-            // Process each file
+            // Process each selected file sequentially
             for (let file of fileInput.files) {
                 const resultContainerId = `result-${generateUUID()}`;
                 const resultDiv = createResultContainer(file.name, resultContainerId);
-                resultsDiv.appendChild(resultDiv);
-                updateResultStatus(resultContainerId, file.name, "アップロード準備中...");
+                resultsDiv.appendChild(resultDiv); // Add container immediately
+                updateResultStatus(resultContainerId, file.name, "Подготовка...");
 
                 try {
                     if (usePolling) {
-                        // --- Asynchronous (Polling) Path ---
+                        // --- Asynchronous Path ---
                         let taskId;
-                        if (useChunkUpload) {
-                            updateResultStatus(resultContainerId, file.name, "チャンクアップロード中...");
-                            // Pass all params needed for finalization
-                            const finalResponse = await uploadFileInChunks(file, chunkSize, device, language, translate, true, file.name, resultContainerId); // Pass polling=true
+                        updateResultStatus(resultContainerId, file.name, "Загрузка и постановка в очередь...", true);
+                        if (useChunkUpload && file.size > chunkSize) { // Only use chunks if file is larger than chunk size
+                            const finalResponse = await uploadFileInChunks(file, chunkSize, device, language, translate, true, file.name, resultContainerId);
                             taskId = finalResponse.task_id;
-                            updateResultStatus(resultContainerId, file.name, `ファイル結合・処理待機中 (Task ID: ${taskId})...`);
                         } else {
-                            updateResultStatus(resultContainerId, file.name, "アップロード中...");
-                            // Use /transcribe with polling=true flag
-                            const response = await uploadFileStandard(file, device, language, translate, true, resultContainerId); // Pass polling=true
+                            const response = await uploadFileStandard(file, device, language, translate, true, resultContainerId);
                             taskId = response.task_id;
-                             updateResultStatus(resultContainerId, file.name, `処理待機中 (Task ID: ${taskId})...`);
                         }
-                        pollTranscription(taskId, file.name, resultContainerId); // Start polling
+                        updateResultStatus(resultContainerId, file.name, `В очереди (ID Задачи: ${taskId}). Ожидание обработки...`, true);
+                        pollTranscription(taskId, file.name, resultContainerId); // Start polling for this task
                     } else {
                         // --- Synchronous Path ---
-                         let transcriptionData;
-                        if (useChunkUpload) {
-                            updateResultStatus(resultContainerId, file.name, "チャンクアップロード中...");
-                             // Pass all params needed for finalization
-                            transcriptionData = await uploadFileInChunks(file, chunkSize, device, language, translate, false, file.name, resultContainerId); // Pass polling=false
-                            updateResultStatus(resultContainerId, file.name, "ファイル結合・文字起こし中..."); // Update status before final result
-                            // The result is directly returned
+                        let transcriptionData;
+                        if (useChunkUpload && file.size > chunkSize) {
+                             updateResultStatus(resultContainerId, file.name, "Загрузка по частям...", true);
+                            transcriptionData = await uploadFileInChunks(file, chunkSize, device, language, translate, false, file.name, resultContainerId);
+                            updateResultStatus(resultContainerId, file.name, "Обработка файла...", true); // Status before final result
                         } else {
-                            updateResultStatus(resultContainerId, file.name, "アップロード＆文字起こし中...");
-                            transcriptionData = await uploadFileStandard(file, device, language, translate, false, resultContainerId); // Pass polling=false
+                            updateResultStatus(resultContainerId, file.name, "Загрузка файла...", true);
+                            transcriptionData = await uploadFileStandard(file, device, language, translate, false, resultContainerId);
+                            updateResultStatus(resultContainerId, file.name, "Обработка файла...", true);
                         }
-                         displayResult(resultContainerId, file.name, transcriptionData);
+                        displayResult(resultContainerId, file.name, transcriptionData); // Display final result
                     }
                 } catch (error) {
-                    console.error("Error processing file:", file.name, error);
-                    displayError(resultContainerId, file.name, error.message || '不明なエラーが発生しました');
+                    console.error("Ошибка обработки файла:", file.name, error);
+                    // Display error in the specific container for this file
+                    displayError(resultContainerId, file.name, error.message || 'Произошла неизвестная ошибка.');
                 }
             } // End loop through files
 
-            setFormDisabled(false); // Re-enable form after all files are processed
+            setFormDisabled(false); // Re-enable form after attempting all files
         });
 
+        // --- UI Update Functions ---
+
         function setFormDisabled(disabled) {
+            // Disable/enable all form elements to prevent changes during processing
             for (let element of formElements) {
-                element.disabled = disabled;
+                // Don't disable the results div or buttons inside it
+                if (!resultsDiv.contains(element)) {
+                     element.disabled = disabled;
+                }
             }
             submitSpinner.style.display = disabled ? 'inline-block' : 'none';
-            submitButtonText.textContent = disabled ? '処理中' : '文字起こし開始';
+            submitButtonText.textContent = disabled ? 'Обработка...' : 'Начать распознавание';
+            // Make sure advanced options toggle reflects disabled state visually if needed
+            toggleAdvanced.style.opacity = disabled ? 0.5 : 1;
+            toggleAdvanced.style.cursor = disabled ? 'not-allowed' : 'pointer';
         }
 
         function createResultContainer(filename, containerId) {
             const div = document.createElement('div');
             div.id = containerId;
-            div.className = 'bg-gray-50 p-4 rounded-lg shadow';
+            div.className = 'bg-gray-50 p-4 rounded-lg shadow border border-gray-200'; // Added border
             div.innerHTML = `
-                <h3 class="font-bold mb-2 text-gray-800">${filename}</h3>
-                <div class="status-message text-gray-600">
-                    <div class="spinner" style="display: none;"></div>
-                    <span>初期化中...</span>
+                <h3 class="font-semibold mb-2 text-gray-800 break-all">${filename}</h3>
+                <div class="status-message text-gray-600 mb-2">
+                    <div class="spinner" style="display: none; width: 16px; height: 16px;"></div>
+                    <span class="ml-1">Инициализация...</span>
                 </div>
-                <div class="progress-bar-container mt-2" style="display: none;">
-                    <div class="w-full bg-gray-200 rounded-full h-2.5">
-                        <div class="progress-bar bg-indigo-600 h-2.5 rounded-full" style="width: 0%"></div>
+                <div class="progress-bar-container mt-1 mb-2" style="display: none;">
+                    <div class="w-full bg-gray-200 rounded-full h-1.5">
+                        <div class="progress-bar bg-indigo-600 h-1.5 rounded-full" style="width: 0%"></div>
                     </div>
-                    <span class="progress-text text-xs text-gray-500">0%</span>
+                    <span class="progress-text text-xs text-gray-500 ml-1">0%</span>
                 </div>
                 <div class="result-content mt-2" style="display: none;">
-                    <p class="mb-2 whitespace-pre-wrap"></p> <!-- pre-wrap to preserve whitespace -->
-                    <div class="action-buttons">
-                        <button onclick="copyToClipboard(this)" class="bg-green-500 hover:bg-green-700 text-white font-bold py-1 px-2 text-sm rounded mr-2">
-                            コピー
+                    <p class="result-text mb-2 whitespace-pre-wrap text-sm"></p> <!-- Added result-text class -->
+                    <div class="action-buttons mt-2">
+                        <button onclick="copyToClipboard(this)" class="bg-green-100 hover:bg-green-200 text-green-800 font-semibold py-1 px-2 text-xs rounded mr-2 transition duration-150 ease-in-out">
+                            Копировать
                         </button>
-                        <a href="#" class="download-link bg-blue-500 hover:bg-blue-700 text-white font-bold py-1 px-2 text-sm rounded" style="display:none;">
-                            ダウンロード (.txt)
+                        <a href="#" class="download-link bg-blue-100 hover:bg-blue-200 text-blue-800 font-semibold py-1 px-2 text-xs rounded transition duration-150 ease-in-out" style="display:none;">
+                            Скачать (.txt)
                         </a>
                     </div>
                 </div>
-                <div class="error-message text-red-500 mt-2" style="display: none;"></div>
+                <div class="error-message text-red-600 mt-2 text-sm" style="display: none;"></div>
             `;
             return div;
         }
 
-        function updateResultStatus(containerId, filename, message, showSpinner = true) {
+        function updateResultStatus(containerId, filename, message, showSpinner = false) {
             const container = document.getElementById(containerId);
             if (!container) return;
             const statusDiv = container.querySelector('.status-message');
@@ -984,10 +982,12 @@ HTML = '''
             const span = statusDiv.querySelector('span');
             spinner.style.display = showSpinner ? 'inline-block' : 'none';
             span.textContent = message;
-            statusDiv.style.display = 'block'; // Ensure status is visible
+            statusDiv.style.display = 'block';
+            // Hide other parts when status updates
             container.querySelector('.result-content').style.display = 'none';
             container.querySelector('.error-message').style.display = 'none';
-            container.querySelector('.progress-bar-container').style.display = 'none'; // Hide progress initially
+             // Keep progress bar if it was visible? Or hide? Let's hide on general status update.
+            // container.querySelector('.progress-bar-container').style.display = 'none';
         }
 
          function updateUploadProgress(containerId, percentage) {
@@ -1001,8 +1001,10 @@ HTML = '''
             const clampedPercentage = Math.max(0, Math.min(100, Math.round(percentage)));
             progressBar.style.width = `${clampedPercentage}%`;
             progressText.textContent = `${clampedPercentage}%`;
-        }
 
+            // Optionally update status message during progress
+            // updateResultStatus(containerId, null, `Загрузка... ${clampedPercentage}%`, true);
+        }
 
         function displayResult(containerId, filename, data) {
             const container = document.getElementById(containerId);
@@ -1012,29 +1014,32 @@ HTML = '''
             container.querySelector('.progress-bar-container').style.display = 'none';
 
             const resultContent = container.querySelector('.result-content');
-            resultContent.querySelector('p').textContent = data.transcription || '（文字起こし結果が空です）';
+            const textParagraph = resultContent.querySelector('p.result-text'); // Target the styled paragraph
+            textParagraph.textContent = data.transcription || '（Результат пуст）'; // Display result or empty message
             const downloadLink = resultContent.querySelector('.download-link');
+
             if (data.id) {
                  downloadLink.href = `/download/${data.id}`;
-                 downloadLink.style.display = 'inline-block'; // Show download link
+                 downloadLink.style.display = 'inline-block';
             } else {
                  downloadLink.style.display = 'none';
             }
-            resultContent.style.display = 'block';
+            resultContent.style.display = 'block'; // Show the results section
         }
 
         function displayError(containerId, filename, errorMsg) {
              const container = document.getElementById(containerId);
             if (!container) return;
+            // Hide other elements
             container.querySelector('.status-message').style.display = 'none';
             container.querySelector('.result-content').style.display = 'none';
             container.querySelector('.progress-bar-container').style.display = 'none';
 
             const errorDiv = container.querySelector('.error-message');
-            errorDiv.textContent = `エラー: ${errorMsg}`;
+            // Show a user-friendly error message
+            errorDiv.textContent = `Ошибка: ${errorMsg.includes('Failed to fetch') ? 'Сетевая ошибка или сервер недоступен.' : errorMsg}`;
             errorDiv.style.display = 'block';
         }
-
 
         // --- Upload Functions ---
 
@@ -1044,48 +1049,60 @@ HTML = '''
             formData.append('device', device);
             formData.append('language', language);
             formData.append('translate', translate);
-            formData.append('polling', polling); // Tell backend if polling is expected
+            formData.append('polling', polling);
 
-            // Use XMLHttpRequest for progress tracking
+            // Use XMLHttpRequest to track upload progress
             return new Promise((resolve, reject) => {
                 const xhr = new XMLHttpRequest();
-                xhr.open('POST', '/transcribe', true); // Always POST to /transcribe
+                xhr.open('POST', '/transcribe', true); // Target the single transcribe endpoint
 
                 xhr.upload.onprogress = (event) => {
                     if (event.lengthComputable) {
                         const percentComplete = (event.loaded / event.total) * 100;
                         updateUploadProgress(containerId, percentComplete);
-                        if (percentComplete < 100) {
-                             updateResultStatus(containerId, file.name, `アップロード中... ${Math.round(percentComplete)}%`, true);
-                        } else {
-                             updateResultStatus(containerId, file.name, `アップロード完了、処理中...`, true);
-                        }
+                        // Can refine status message based on progress
+                        // if (percentComplete < 100) {
+                        //      updateResultStatus(containerId, file.name, `Загрузка... ${Math.round(percentComplete)}%`, true);
+                        // }
                     }
                 };
 
+                 xhr.onloadstart = () => {
+                    updateResultStatus(containerId, file.name, `Загрузка файла...`, true);
+                };
+
                 xhr.onload = () => {
-                    if (xhr.status >= 200 && xhr.status < 300) {
+                     if (xhr.status >= 200 && xhr.status < 300) {
+                        updateResultStatus(containerId, file.name, `Файл загружен, обработка...`, true);
                         try {
                             resolve(JSON.parse(xhr.responseText));
                         } catch (e) {
-                             reject(new Error("サーバーからの応答が無効です: " + xhr.responseText));
+                             console.error("Invalid JSON response:", xhr.responseText);
+                             reject(new Error("Неверный ответ от сервера."));
                         }
                     } else {
-                        let errorMsg = `サーバーエラー (${xhr.status})`;
+                        // Attempt to parse error from server response
+                        let errorMsg = `Ошибка сервера (${xhr.status})`;
                         try {
                             const errorData = JSON.parse(xhr.responseText);
                             errorMsg = errorData.error || errorMsg;
                         } catch (e) { /* Ignore parse error, use status text */ }
+                         console.error("Upload failed:", xhr.status, xhr.statusText, xhr.responseText);
                         reject(new Error(errorMsg));
                     }
                 };
 
                 xhr.onerror = () => {
-                    reject(new Error('ネットワークエラーが発生しました'));
+                    console.error("Network error during upload");
+                    reject(new Error('Сетевая ошибка при загрузке файла.'));
+                };
+
+                 xhr.ontimeout = () => {
+                     console.error("Upload timed out");
+                    reject(new Error('Время ожидания загрузки истекло.'));
                 };
 
                 xhr.send(formData);
-                updateResultStatus(containerId, file.name, `アップロード開始...`, true);
             });
         }
 
@@ -1095,7 +1112,8 @@ HTML = '''
             const fileId = generateUUID();
             let chunksUploaded = 0;
 
-            console.log(`Uploading ${originalFilename} in ${totalChunks} chunks (ID: ${fileId})`);
+            console.log(`Начало загрузки ${originalFilename} (${(file.size / 1024 / 1024).toFixed(2)} MB) по частям (${totalChunks} шт.) ID: ${fileId}`);
+            updateResultStatus(containerId, originalFilename, `Загрузка части 1/${totalChunks}...`, true);
 
             for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
                 const start = chunkIndex * chunkSize;
@@ -1103,130 +1121,149 @@ HTML = '''
                 const chunk = file.slice(start, end);
 
                 const formData = new FormData();
-                formData.append('file', chunk);
+                formData.append('file', chunk, `${originalFilename}.part${chunkIndex}`); // Add filename to chunk for clarity
                 formData.append('fileId', fileId);
                 formData.append('chunkIndex', chunkIndex);
                 formData.append('totalChunks', totalChunks);
-                 // Include other params with *every* chunk, backend will use the last one's params.json
-                formData.append('device', device);
-                formData.append('language', language);
-                formData.append('translate', translate);
-                formData.append('polling', polling); // Important for backend params.json
-                formData.append('originalFilename', originalFilename); // Send original filename
+                // Include all necessary parameters with the *last* chunk (backend reads params.json)
+                // Sending with every chunk is slightly redundant but harmless if backend handles it correctly.
+                // Crucially, the *last* chunk *must* have them for params.json creation.
+                if (chunkIndex === totalChunks - 1) {
+                    formData.append('device', device);
+                    formData.append('language', language);
+                    formData.append('translate', translate);
+                    formData.append('polling', polling);
+                    formData.append('originalFilename', originalFilename);
+                 }
 
-                const chunkEndpoint = '/transcribe_chunk'; // Always use the same chunk endpoint
+                const chunkEndpoint = '/transcribe_chunk'; // Single endpoint for chunks
 
                 try {
-                    // Use fetch for chunk uploads as progress isn't per-chunk critical here
-                    const response = await fetch(chunkEndpoint, {
-                        method: 'POST',
-                        body: formData
-                        // No need for Content-Type header, FormData sets it
-                    });
+                    // Use fetch, progress is tracked by chunk count
+                    const response = await fetch(chunkEndpoint, { method: 'POST', body: formData });
 
                     if (!response.ok) {
-                        let errorMsg = `チャンク ${chunkIndex + 1} のアップロード失敗 (${response.status})`;
+                        let errorMsg = `Ошибка загрузки части ${chunkIndex + 1} (${response.status})`;
                          try {
                             const errorData = await response.json();
                             errorMsg = errorData.error || errorMsg;
-                        } catch (e) { /* Ignore */ }
+                        } catch (e) { /* Ignore parse error */ }
                         throw new Error(errorMsg);
                     }
-                    // Update progress based on chunks uploaded
+
                     chunksUploaded++;
                     const percentComplete = (chunksUploaded / totalChunks) * 100;
-                    updateUploadProgress(containerId, percentComplete);
-                    updateResultStatus(containerId, file.name, `チャンクアップロード中 (${chunksUploaded}/${totalChunks})... ${Math.round(percentComplete)}%`, true);
+                    updateUploadProgress(containerId, percentComplete); // Update progress bar
+                     if (chunksUploaded < totalChunks) {
+                        updateResultStatus(containerId, originalFilename, `Загрузка части ${chunksUploaded + 1}/${totalChunks}...`, true);
+                    } else {
+                         updateResultStatus(containerId, originalFilename, `Все части загружены (${totalChunks}/${totalChunks}). Сборка файла...`, true);
+                    }
 
-                    // Optional: Small delay between chunks if needed
-                    // await new Promise(resolve => setTimeout(resolve, 50));
+                    // Optional small delay between chunks? Probably not necessary.
+                    // await new Promise(resolve => setTimeout(resolve, 10));
 
                 } catch (error) {
-                    console.error(`Chunk upload error: ${error.message}`);
-                    throw new Error(`チャンク ${chunkIndex + 1} のアップロード中にエラー: ${error.message}`);
+                    console.error(`Ошибка загрузки части ${chunkIndex + 1}: ${error.message}`);
+                    // Throw error to stop the loop for this file
+                    throw new Error(`Ошибка при загрузке части ${chunkIndex + 1}: ${error.message}`);
                 }
-            }
+            } // End chunk loop
 
-            console.log(`All chunks uploaded for ${fileId}. Finalizing...`);
-            updateResultStatus(containerId, file.name, `全チャンク (${totalChunks}/${totalChunks}) アップロード完了、最終処理中...`, true);
+            console.log(`Все части загружены для ${fileId}. Запрос на финализацию...`);
 
-            // Finalize the upload
+            // Finalize the upload (reconstruct and start processing)
             const finalizeEndpoint = polling ? '/transcribe_finalize_async' : '/transcribe_finalize';
             const finalResponse = await fetch(finalizeEndpoint, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                // Body only needs fileId, other params were saved by backend
-                body: JSON.stringify({ fileId: fileId })
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileId: fileId }) // Only need fileId
             });
 
             if (!finalResponse.ok) {
-                let errorMsg = `最終処理失敗 (${finalResponse.status})`;
+                let errorMsg = `Ошибка финализации (${finalResponse.status})`;
                  try {
                     const errorData = await finalResponse.json();
                     errorMsg = errorData.error || errorMsg;
                 } catch (e) { /* Ignore */ }
+                 console.error(`Finalization failed for ${fileId}: ${errorMsg}`);
                 throw new Error(errorMsg);
             }
 
-             return await finalResponse.json(); // Returns {task_id} for async or {transcription, id} for sync
+             console.log(`Финализация для ${fileId} запрошена успешно.`);
+             // Return the response from finalize (contains task_id or transcription)
+             return await finalResponse.json();
         }
 
-        // --- Polling ---
+
+        // --- Polling Function ---
 
         async function pollTranscription(taskId, filename, containerId) {
-            console.log(`Polling started for task ${taskId} (${filename})`);
-            updateResultStatus(containerId, filename, `処理待機中 (Task ID: ${taskId})...`, true);
+            console.log(`Начало опроса статуса для задачи ${taskId} (${filename})`);
+            // Initial status update handled before calling poll
 
-            const pollInterval = 5000; // 5 seconds
+            const pollInterval = 5000; // Check every 5 seconds
             let consecutiveErrors = 0;
-            const maxErrors = 5;
+            const maxErrors = 6; // Increase max errors slightly
 
             const intervalId = setInterval(async () => {
                 try {
                     const response = await fetch(`/status/${taskId}`);
 
+                    // Handle network errors or server down
                     if (!response.ok) {
-                        // Handle specific errors like 404 (task not found)
                         if (response.status === 404) {
-                             throw new Error(`タスク ${taskId} が見つかりません。サーバーで削除された可能性があります。`);
+                            console.warn(`Задача ${taskId} не найдена сервером (возможно, завершена и очищена или неверный ID).`);
+                             throw new Error(`Задача ${taskId} не найдена.`); // Stop polling
                         }
-                        throw new Error(`ステータス確認中にサーバーエラー (${response.status})`);
+                         // Other server errors (5xx)
+                         throw new Error(`Ошибка сервера при проверке статуса (${response.status}).`);
                     }
 
                     const data = await response.json();
-                    consecutiveErrors = 0; // Reset error count on success
+                    consecutiveErrors = 0; // Reset error count on successful fetch
 
-                    updateResultStatus(containerId, filename, `処理中 (ステータス: ${data.status})...`, true);
-
-                    if (data.status === 'completed') {
-                        clearInterval(intervalId);
-                        console.log(`Task ${taskId} completed.`);
-                         displayResult(containerId, data.filename || filename, data); // Use filename from status if available
-                    } else if (data.status === 'error') {
-                        clearInterval(intervalId);
-                        console.error(`Task ${taskId} failed: ${data.error}`);
-                         displayError(containerId, data.filename || filename, data.error || '不明なエラーが発生しました');
-                    } else if (data.status === 'processing') {
-                        // Continue polling
-                        console.log(`Task ${taskId} is still processing...`);
-                        updateResultStatus(containerId, data.filename || filename, '文字起こし処理中...', true);
-                    } else if (data.status === 'not_found') {
-                        // Should be caught by response.ok check, but handle explicitly
-                        throw new Error(`タスク ${taskId} が見つかりません。`);
+                    // Update UI based on status
+                    switch(data.status) {
+                        case 'completed':
+                            clearInterval(intervalId);
+                            console.log(`Задача ${taskId} (${filename}) завершена.`);
+                            displayResult(containerId, data.filename || filename, data);
+                            break;
+                        case 'error':
+                            clearInterval(intervalId);
+                            console.error(`Задача ${taskId} (${filename}) завершилась с ошибкой: ${data.error}`);
+                            displayError(containerId, data.filename || filename, data.error || 'Произошла ошибка обработки.');
+                            break;
+                        case 'processing':
+                            console.log(`Задача ${taskId} (${filename}) все еще обрабатывается...`);
+                            // More specific status message? Could potentially get progress info if backend provided it.
+                            updateResultStatus(containerId, data.filename || filename, 'Идет обработка...', true);
+                            break;
+                        case 'not_found': // Should be caught by !response.ok, but handle defensively
+                             clearInterval(intervalId);
+                             console.warn(`Задача ${taskId} не найдена (ответ от API).`);
+                             displayError(containerId, filename, `Задача ${taskId} не найдена.`);
+                            break;
+                        default:
+                            // Unknown status - log it, maybe stop polling?
+                             console.warn(`Неизвестный статус задачи ${taskId}: ${data.status}`);
+                             updateResultStatus(containerId, data.filename || filename, `Неизвестный статус: ${data.status}`, true);
+                             // Possibly stop polling if status is unexpected
+                             // clearInterval(intervalId);
                     }
 
                 } catch (error) {
-                    console.error(`Polling error for task ${taskId}: ${error.message}`);
+                    console.error(`Ошибка опроса для задачи ${taskId}: ${error.message}`);
                     consecutiveErrors++;
+                    updateResultStatus(containerId, filename, `Ошибка опроса (${consecutiveErrors}/${maxErrors})...`, true);
+
                     if (consecutiveErrors >= maxErrors) {
                          clearInterval(intervalId);
-                         displayError(containerId, filename, `ポーリング中に連続エラーが発生しました。処理が中断された可能性があります: ${error.message}`);
-                    } else {
-                        // Show transient error in status?
-                        updateResultStatus(containerId, filename, `ポーリングエラー (${consecutiveErrors}/${maxErrors})... 再試行中`, true);
+                         console.error(`Превышено максимальное количество ошибок опроса для задачи ${taskId}. Остановка.`);
+                         displayError(containerId, filename, `Не удалось получить статус задачи после нескольких попыток: ${error.message}.`);
                     }
+                    // Continue polling after transient errors
                 }
             }, pollInterval);
         }
@@ -1234,7 +1271,7 @@ HTML = '''
 
         // --- Utilities ---
 
-        function generateUUID() {
+        function generateUUID() { // Basic UUID generator
             return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
                 const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
                 return v.toString(16);
@@ -1242,27 +1279,35 @@ HTML = '''
         }
 
         function copyToClipboard(button) {
-            // Find the paragraph within the same result-content container
+            // Find the text paragraph within the same result-content container
             const resultContainer = button.closest('.result-content');
-            if (!resultContainer) return;
-            const textToCopy = resultContainer.querySelector('p')?.textContent;
+            if (!resultContainer) {
+                console.error("Could not find result container for copy button.");
+                return;
+            }
+            const textToCopy = resultContainer.querySelector('p.result-text')?.textContent; // Target the styled paragraph
 
-            if (!textToCopy) {
-                 alert('コピーするテキストが見つかりません。');
+            if (textToCopy === null || textToCopy === undefined || textToCopy.trim() === '') {
+                 alert('Нет текста для копирования.');
                 return;
             }
 
             navigator.clipboard.writeText(textToCopy).then(() => {
                 const originalText = button.textContent;
-                button.textContent = 'コピー完了!';
+                button.textContent = 'Скопировано!';
                 button.disabled = true;
+                // Briefly change style to indicate success
+                 button.classList.remove('bg-green-100', 'hover:bg-green-200', 'text-green-800');
+                 button.classList.add('bg-green-500', 'text-white');
                 setTimeout(() => {
                     button.textContent = originalText;
                     button.disabled = false;
-                }, 2000);
+                    button.classList.add('bg-green-100', 'hover:bg-green-200', 'text-green-800');
+                    button.classList.remove('bg-green-500', 'text-white');
+                }, 2000); // Revert after 2 seconds
             }).catch(err => {
-                console.error('Clipboard copy failed: ', err);
-                alert('クリップボードへのコピーに失敗しました。');
+                console.error('Ошибка копирования в буфер обмена: ', err);
+                alert('Не удалось скопировать текст. Ваш браузер может не поддерживать эту функцию или требовать HTTPS.');
             });
         }
 
@@ -1273,20 +1318,28 @@ HTML = '''
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    print("Starting Flask server...")
+    print("--- Whisper Flask Server ---")
     print(f"Upload folder: {os.path.abspath(UPLOAD_FOLDER)}")
     print(f"Transcription folder: {os.path.abspath(TRANSCRIPTION_FOLDER)}")
     print(f"Temp chunk folder: {os.path.abspath(TEMP_CHUNK_FOLDER)}")
+    print(f"FFmpeg path: {FFMPEG_PATH}")
     print(f"Available devices: {available_devices}")
     print(f"Default device: {default_device}")
-    print(f"IMPORTANT: If using GPU, ensure your PyTorch installation is compatible with your GPU's Compute Capability!")
-    # Consider adding a check here if possible
-    # initialize_model(default_device) # Optional: Pre-initialize default model at startup
+    print(f"Default language: {DEFAULT_LANGUAGE}")
+    print("-" * 30)
+    print("Starting server on http://0.0.0.0:5000 ...")
+    print("IMPORTANT: If using GPU, ensure PyTorch is correctly installed with CUDA support matching your drivers and GPU capability!")
+    print("-" * 30)
 
-    # Use waitress or gunicorn for production instead of Flask development server
-    # For development:
-    app.run(host='0.0.0.0', port=5000, debug=False) # debug=False is safer
-
-    # Example using waitress (install with pip install waitress):
-    # from waitress import serve
-    # serve(app, host='0.0.0.0', port=5000)
+    # Use waitress or gunicorn in production for better performance and stability
+    # Example using waitress (install with: pip install waitress)
+    try:
+        from waitress import serve
+        print("Using Waitress server.")
+        serve(app, host='0.0.0.0', port=5000, threads=8) # Adjust threads as needed
+    except ImportError:
+        print("Waitress not found, falling back to Flask development server (not recommended for production).")
+        print("Install waitress: pip install waitress")
+        # Development server (use only for testing)
+        # debug=True enables auto-reloading but can cause issues with models and threads
+        app.run(host='0.0.0.0', port=5000, debug=False)
